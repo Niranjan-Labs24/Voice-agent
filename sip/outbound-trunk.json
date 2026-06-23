@@ -1,0 +1,8 @@
+{
+  "name": "Outbound Trunk",
+  "numbers": ["+91XXXXXXXXXX"],
+  "auth_username": "YOUR_ZENTRUNK_USERNAME",
+  "auth_password": "YOUR_ZENTRUNK_PASSWORD",
+  "address": "YOUR_ZENTRUNK_URI",
+  "transport": "tcp"
+}
