@@ -1,7 +1,9 @@
 import { type JobContext, type JobProcess, WorkerOptions, cli, defineAgent, llm, voice, tokenize } from '@livekit/agents';
 import * as google from '@livekit/agents-plugin-google';
+import * as openai from '@livekit/agents-plugin-openai';
 import * as sarvam from '@livekit/agents-plugin-sarvam';
 import * as silero from '@livekit/agents-plugin-silero';
+import * as aiCoustics from '@livekit/plugins-ai-coustics';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import dotenv from 'dotenv';
@@ -13,18 +15,34 @@ import { analyzeCallAndGenerateOutcome } from './summarizer.js';
 
 const FILLERS: Record<Lang, string[]> = {
   'en-IN': ['Hmm...', 'Okay...', 'Right...', 'Got it...', 'Yeah...'],
-  'hi-IN': ['हम्म...', 'अच्छा...', 'ठीक है...', 'जी...'],
-  'ta-IN': ['ம்ம்...', 'சரி...', 'சரிங்க...', 'புரிந்தது...'],
+  'hi-IN': ['Hmm...', 'Okay...', 'Right...', 'Got it...', 'Yeah...'],
+  'ta-IN': ['Hmm...', 'Okay...', 'Right...', 'Got it...', 'Yeah...'],
 };
 
+class HindiSentenceTokenizer extends tokenize.basic.SentenceTokenizer {
+  override tokenize(text: string, language?: string): string[] {
+    const cleanedText = text.replace(/।/g, '.');
+    return super.tokenize(cleanedText, language);
+  }
 
+  override stream(language?: string): tokenize.SentenceStream {
+    const baseStream = super.stream(language);
+    const originalPushText = baseStream.pushText;
+    baseStream.pushText = function (this: any, text: string) {
+      const cleaned = text.replace(/।/g, '.');
+      return originalPushText.call(this, cleaned);
+    };
+    return baseStream;
+  }
+}
 
 export default defineAgent({
   prewarm: async (proc: JobProcess) => {
     // Tuned VAD for natural pauses and stable rate limiting
     proc.userData.vad = await silero.VAD.load({
-      minSilenceDuration: 500,
-      minSpeechDuration: 50,
+      minSilenceDuration: 350,
+      minSpeechDuration: 120,
+      activationThreshold: 0.4,
     });
   },
 
@@ -74,22 +92,51 @@ export default defineAgent({
     const session = new voice.AgentSession({
       vad: ctx.proc.userData.vad as silero.VAD,
       stt: new sarvam.STT({ model: 'saaras:v3', languageCode: lang, mode: 'transcribe' }),
-      llm: new google.LLM({
-        model: 'gemini-2.5-flash',
-        apiKey: process.env.GEMINI_API_KEY || '',
+      llm: new openai.LLM({
+        model: 'qwen3-30b-a3b-instruct-2507',
+        apiKey: process.env.DASHSCOPE_API_KEY || '',
+        baseURL: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
         temperature: 0.4,
       }),
       tts: new sarvam.TTS({
         model: 'bulbul:v3',
         targetLanguageCode: lang,
         speaker: VOICES[lang],
-        sentenceTokenizer: new tokenize.basic.SentenceTokenizer({ minSentenceLength: 2 }),
-        pace: 1.15,
+        sampleRate: 8000,
+        sentenceTokenizer: new HindiSentenceTokenizer({ minSentenceLength: 10 }),
+        pace: 1.1,
       }),
 
 
-      voiceOptions: {
-        preemptiveGeneration: true,
+      turnHandling: {
+        preemptiveGeneration: {
+          enabled: true,
+          preemptiveTts: true,
+        },
+        interruption: {
+          mode: 'adaptive',
+          minDuration: 600,
+          minWords: 1,
+          resumeFalseInterruption: true,
+        }
+      }
+    });
+
+    let agentState = 'idle';
+    session.on('agent_state_changed' as any, (ev: any) => {
+      agentState = ev.newState;
+    });
+
+    session.on('user_state_changed' as any, (ev: any) => {
+      if (ev.oldState === 'speaking' && ev.newState === 'listening') {
+        if (agentState !== 'speaking') {
+          const langFillers = FILLERS[currentLang] || FILLERS['en-IN'];
+          const randomFiller = langFillers[Math.floor(Math.random() * langFillers.length)];
+          if (randomFiller) {
+            console.log(`[FILLER] Playing immediate VAD-based filler: "${randomFiller}"`);
+            session.say(randomFiller, { addToChatCtx: false });
+          }
+        }
       }
     });
 
@@ -158,36 +205,23 @@ export default defineAgent({
       }
     });
 
-    class FillerAgent extends voice.Agent {
-      private getActiveLang: () => Lang;
-
-      constructor(options: voice.AgentOptions<any>, getActiveLang: () => Lang) {
-        super(options);
-        this.getActiveLang = getActiveLang;
-      }
-
-      override async onUserTurnCompleted(chatCtx: llm.ChatContext, newMessage: llm.ChatMessage) {
-        const text = (newMessage.textContent || '').trim();
-        if (text.length > 0) {
-          const activeLang = this.getActiveLang();
-          const langFillers = FILLERS[activeLang] || FILLERS['en-IN'];
-          const randomFiller = langFillers[Math.floor(Math.random() * langFillers.length)];
-          if (randomFiller) {
-            console.log(`[FILLER] Playing filler: "${randomFiller}" for language: ${activeLang}`);
-            this.session.say(randomFiller, { addToChatCtx: false });
-          }
-        }
-      }
-
-    }
-
-    const agent = new FillerAgent({
+    const agent = new voice.Agent({
       instructions: fill(PROMPTS[lang], vars),
       tools: { endCall, switchLanguage },
-    }, () => currentLang);
+    });
 
 
-    await session.start({ agent, room: ctx.room });
+    await session.start({
+      agent,
+      room: ctx.room,
+      inputOptions: {
+        noiseCancellation: aiCoustics.audioEnhancement({
+          modelParameters: {
+            enhancementLevel: 0.85,
+          },
+        }),
+      },
+    });
     await ctx.connect();
 
     let greetingSpoken = false;
@@ -201,12 +235,12 @@ export default defineAgent({
 
     // If the caller already has subscribed tracks when we connect, speak immediately
     const caller = ctx.room.remoteParticipants.get('caller-1');
-    const hasAudio = Array.from(caller?.trackPublications.values() ?? []).some(p => p.subscribed);
+    const hasAudio = Array.from(caller?.trackPublications.values() ?? []).some((p: any) => p.subscribed);
     
     if (hasAudio) {
       speakGreeting();
     } else {
-      ctx.room.on('trackSubscribed', (track, publication, participant) => {
+      ctx.room.on('trackSubscribed', (track: any, publication: any, participant: any) => {
         if (participant.identity === 'caller-1') {
           speakGreeting();
         }
