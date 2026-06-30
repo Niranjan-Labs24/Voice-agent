@@ -15,8 +15,8 @@ import { analyzeCallAndGenerateOutcome } from './summarizer.js';
 
 const FILLERS: Record<Lang, string[]> = {
   'en-IN': ['Hmm...', 'Okay...', 'Right...', 'Got it...', 'Yeah...'],
-  'hi-IN': ['Hmm...', 'Okay...', 'Right...', 'Got it...', 'Yeah...'],
-  'ta-IN': ['Hmm...', 'Okay...', 'Right...', 'Got it...', 'Yeah...'],
+  'hi-IN': ['हाँ जी...', 'अच्छा...', 'hmm...', 'एक second...'],
+  'ta-IN': ['சரி...', 'ஆமா...', 'hmm...', 'ஒரு நிமிஷம்...'],
 };
 
 class HindiSentenceTokenizer extends tokenize.basic.SentenceTokenizer {
@@ -41,7 +41,7 @@ async function prewarmLlmCache(systemPrompt: string, tools: any, retries = 1) {
     model: 'qwen3-30b-a3b-instruct-2507',
     apiKey: process.env.DASHSCOPE_API_KEY || '',
     baseURL: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
-    temperature: 0.4,
+    temperature: 0.9,
     // @ts-ignore
     extraBody: { enable_thinking: false },
   });
@@ -160,7 +160,7 @@ export default defineAgent({
         model: 'qwen3-30b-a3b-instruct-2507',
         apiKey: process.env.DASHSCOPE_API_KEY || '',
         baseURL: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
-        temperature: 0.4,
+        temperature: 0.9,
         // @ts-ignore — DashScope extension parameter
         extraBody: { enable_thinking: false },
       }),
@@ -168,8 +168,9 @@ export default defineAgent({
         model: 'bulbul:v3',
         targetLanguageCode: lang,
         speaker: VOICES[lang],
-        sentenceTokenizer: new tokenize.basic.SentenceTokenizer({ minSentenceLength: 2 }),
+        sentenceTokenizer: new HindiSentenceTokenizer({ minSentenceLength: 2 }),
         pace: 1.15,
+        temperature: 0.8, // Increases voice expressiveness and emotion (Default is 0.6)
       }),
 
 
@@ -195,10 +196,8 @@ export default defineAgent({
       agentState = ev.newState;
     });
 
-    // Commented out to prevent the agent's voice from stuttering/breaking.
-    // Since ElevenLabs Flash response is fast (~1.2s total delay), playing an
-    // immediate VAD filler is cut off immediately by the incoming LLM response.
-    /*
+    // Immediate VAD-based filler injection
+    // As soon as the user stops speaking, this will trigger a filler word while the LLM generates the real response.
     session.on('user_state_changed' as any, (ev: any) => {
       if (ev.oldState === 'speaking' && ev.newState === 'listening') {
         if (agentState !== 'speaking') {
@@ -211,7 +210,6 @@ export default defineAgent({
         }
       }
     });
-    */
 
     session.on('metrics_collected' as any, (ev: any) => {
       console.log('METRICS RAW:', JSON.stringify(ev, null, 2));
